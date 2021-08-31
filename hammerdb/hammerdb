@@ -1,0 +1,237 @@
+#!/bin/bash
+arguments="$@"
+value=`echo "${0}" | awk -F"/" '{print NF-1}'`
+exec_dir=`echo $0 | cut -d'/' -f 1-${value}`
+test_name="hammerdb"
+
+## Disable selinux
+setenforce 0
+tuned_original=""
+disks=none
+user=""
+fs="xfs"
+tools_git=https://github.com/dvalinrh/test_tools
+warehouses=""
+
+#
+# Clone the repo that contains the common code and tools
+#
+found=0
+for arg in "$@"; do
+	if [ $found -eq 1 ]; then
+		tools_git=$arg
+		break;
+	fi
+	if [[ $arg == "--tools_git" ]]; then
+		found=1
+	fi
+
+	#
+	# Check to see if usage is requested, if so call usage.
+	# We do this so we do not pull in the common git.
+	#
+	if [[ $arg == "--usage" ]]; then
+		usage $0
+	fi
+done
+
+if [ ! -d "test_tools" ]; then
+        git clone $tools_git
+        if [ $? -ne 0 ]; then
+                echo pulling git $tools_git failed.
+                exit
+        fi
+fi
+
+#
+# Variables set
+#
+# TOOLS_BIN: points to the tool directory
+# to_home_root: home directory
+# to_configuration: configuration information
+# to_times_to_run: number of times to run the test
+# to_pbench: Run the test via pbench
+# to_puser: User running pbench
+# to_run_label: Label for the run
+# to_user: User on the test system running the test
+# to_sys_type: for results info, basically aws, azure or local
+# to_sysname: name of the system
+# to_tuned_setting: tuned setting
+#
+
+source test_tools/general_setup "$@"
+
+dnf -y install lvm2
+
+unset DISPLAY
+users_to_run=""
+test="none"
+
+create_and_mount_fs()
+{
+
+	echo $disks
+	if [[ $disks == "grab_disks" ]]; then
+		results=`$TOOLS_BIN/grab_disks ${disks}`
+		if [ $? -ne 0 ]; then
+			echo grab disks failed.
+			exit 1
+		fi
+        	max_disks=`echo $results | cut -d: -f 2`
+        	disks=`echo $results | cut -d: -f 1  | sed "s/,/ /g"`
+	else
+		disks=`echo $disks | sed "s/,/ /g"`
+		max_disks=`echo $disks | tr -d -c ' '  | awk '{ print length; }'`
+		let "max_disks=${max_disks}+1"
+	fi
+
+	cd $to_home_root/$to_user
+	echo $disks > disks
+	umount /perf1
+
+
+	$TOOLS_BIN/lvm_create --devices "${disks}" --lvm_vol hammerdb --lvm_grp hammerdb
+	if [ $? -ne 0 ]; then
+		echo LVM create failed.
+		exit 1
+	fi
+	mkdir /perf1
+	$TOOLS_BIN/create_filesystem --fs_type $fs --mount_dir /perf1 --device /dev/hammerdb/hammerdb
+	if [ $? -ne 0 ]; then
+		echo filesystem create failedd.
+		exit 1
+	fi
+}
+
+usage()
+{
+	echo "$1 usge:"
+	echo "--disks <disks>: Comma separated list of disks.  Special type, known as grab_disk"
+	echo "  is also supported.  grab_disks locates all the disks that are not mounted and places"
+	echo "  into file.  Those disks are what will be used to build the filesystem with"
+	echo "  Note grab_disk does not recognize devices that have filesystems on them but are"
+	echo "  not mounted, the device is considered avaialble for use and will be placed in the"
+	echo "  file and be used in the creation of the filesystem.  grab_disk is part fo the zathras kit."
+	echo "--filesys: filesys type to use.  XFS is the default"
+	echo "--sub_test test running:  Test we are to run.  Supported tests are"
+	echo "    mariadb, mssql and postgres"
+	echo "--users <users>: Comma separate of the number of users to run.  Example"
+	echo "     --users 10,20,30"
+	echo "--usage: This usage message"
+	exit
+}
+
+#
+# Define options
+#
+ARGUMENT_LIST=(
+	"disks"
+	"filesys"
+	"home_parent"
+	"iterations"
+	"run_user"
+	"sub_test"
+	"tools_git"
+	"warehouses"
+	"users"
+)
+
+NO_ARGUMENTS=(
+	"usage"
+)
+
+# read arguments
+opts=$(getopt \
+    --longoptions "$(printf "%s:," "${ARGUMENT_LIST[@]}")" \
+    --longoptions "$(printf "%s," "${NO_ARGUMENTS[@]}")" \
+    --name "$(basename "$0")" \
+    --options "h" \
+    -- "$@"
+)
+
+if [ $? -ne 0 ]; then
+	exit
+fi
+
+eval set --$opts
+
+echo testing now
+while [[ $# -gt 0 ]]; do
+        case "$1" in
+                --disks)
+			disks=$2
+			shift 2
+		;;
+		--filesys)
+			fs=${2}
+			shift 2
+		;;
+                --iterations)
+                        iterations=${2}
+			shift 2
+                ;;
+		--users)
+			setto=`echo $2 | sed "s/,/ /g"`
+			users_to_run="-u \"${setto}\""
+			shift 2
+		;;
+		--sub_test)
+			test=$2
+			shift 2
+		;;
+		--warehouses)
+			warehouses="-w $2"
+			shift 2
+		;;
+		--usage)
+			usage $0
+		;;
+		-h)
+			usage $0
+		;;
+		--)
+			break; 
+		;;
+		*)
+			echo option not found $1
+			usage $0
+		;;
+        esac
+done
+
+if [[ $test == "none" ]]; then
+	echo You must designate a test, mssql, mariadb, postgres
+	usage $0
+fi
+
+if [ $to_pbench -eq 1 ]; then
+	echo $TOOLS_BIN/execute_pbench --cmd_executing "$0" $arguments --test $test_name --spacing 11
+	$TOOLS_BIN/execute_pbench --cmd_executing "$0" $arguments --test $test_name --spacing 11
+	exit
+fi
+
+create_and_mount_fs
+
+#
+# change to the execution directory.
+#
+if [[ $to_tuned_setting != "none" ]]; then
+	tuned_original=`tuned-adm active | cut -d' ' -f4`
+	tuned-adm profile $to_tuned_setting
+fi
+cd $exec_dir
+echo ./run_hammerdb -m /perf1 -t ${test} ${users_to_run} ${warehouses} > run_this
+chmod 755 run_this
+./run_this
+cd /usr/local
+mv HammerDB $test
+tar cf /tmp/results_hammerdb_${test}_${to_tuned_setting}.tar $test
+mv $test HammerDB
+if [[ $to_tuned_setting != "none" ]]; then
+	tuned-adm profile $tuned_original
+fi
+## Re-enable selinux
+setenforce 1
+
+$TOOLS_BIN/lvm_delete --lvm_vol hammerdb --lvm_grp hammerdb --mount_pnt /perf1
+exit 0

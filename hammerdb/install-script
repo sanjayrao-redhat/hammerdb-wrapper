@@ -1,0 +1,281 @@
+#!/bin/bash
+
+#
+# Script to set the system up for running hammerdb.
+#
+disks=none
+mountpoint=none
+db_type=none
+
+install_mssql()
+{
+	cp /tmp/hammerdb-tpcc/mssql/mssql-repo-2019.repo /etc/yum.repos.d
+	yum -y install mssql-server
+	curl https://packages.microsoft.com/config/rhel/7/prod.repo > /etc/yum.repos.d/msprod.repo
+	yum -y remove unixODBC-utf16 unixODBC-utf16-devel
+	ACCEPT_EULA=Y yum install -y mssql-tools unixODBC-devel
+	echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bash_profile
+	cd /usr/local/HammerDB
+	cp -R  /tmp/hammerdb-tpcc/mssql/* .
+
+
+	rm -rf ${mountpoint}/mssql_data/*
+	mkdir -p ${mountpoint}/mssql_data
+	chown -R mssql:mssql ${mountpoint}/mssql_data 
+	chown -R mssql:mssql /perf1/mssql_data
+	
+	systemctl stop mssql-server
+
+	cd /opt/mssql/bin/
+	mkdir /var/opt/mssql/secrets/
+
+	MSSQL_SA_PASSWORD="100yard-"
+	export MSSQL_SA_PASSWORD
+    export MSSQL_PID="Evaluation"
+
+	rm -rf /var/opt/mssql
+	chmod 777 /var/opt
+
+	echo 1 > input
+	echo Yes >> input
+	echo 100yard- >> input
+	echo 100yard- >> input
+
+	./mssql-conf -n setup accept-eula < input
+
+	sleep 30
+	systemctl stop mssql-server
+
+	cd /var/opt/mssql
+	mv data ${mountpoint}/mssql_data
+	ln -sf ${mountpoint}/mssql_data/data .
+
+	systemctl disable mssql-server.service
+	systemctl restart mssql-server.service
+
+	cd /usr/local/HammerDB
+
+	./createdb_mssql_mnt.sh -m ${mountpoint} > crdb.out 2>&1
+
+	./update_temp_mnt.sh -m ${mountpoint} > upd_tmp.out 2>&1
+}
+
+install_mariadb()
+{
+	#
+	# Install Mariadb Server and tools
+	#
+	dnf -y install mariadb.x86_64 mariadb-common.x86_64 mariadb-devel.x86_64 \
+	mariadb-errmsg.x86_64 mariadb-server.x86_64 mariadb-server-utils.x86_64 mysql-libs.x86_64
+
+	#
+	# Configure things in and mount the appropriate item.
+	#
+	cd /usr/local/HammerDB
+	cp -R  /tmp/hammerdb-tpcc/mariadb/* .
+
+	#
+	# Clean up any residual stuff and set up the directories
+	#
+	rm -rf ${mountpoint}/mysql/*
+	mkdir -p ${mountpoint}/mysql/data
+	chown -R mysql:mysql ${mountpoint}/mysql
+
+	totmem=`cat /proc/meminfo | grep "MemTotal:" | awk '{print $2}'`
+	#
+	# Updating the value of buffer_pool_size based on available memory
+	# Setting bufferpool to half of physical memory if memory is less than 128G else set to 64G
+	#
+	totmem_BP=`expr $totmem / 1024`
+	totmem_BP=`expr $totmem_BP / 2`
+
+	#
+	# Configure the mariadb config file with mountpoint and bufferpool
+	#
+
+	sed -i "s+^datadir=.*+datadir=${mountpoint}\/mysql\/data+" my.cnf
+	if [ $totmem_BP -lt 64000 ]; then
+   		sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=${totmem_BP}M/" my.cnf
+	else
+   		sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=64000M/" my.cnf
+	fi
+
+	/usr/bin/cp my.cnf /etc/my.cnf
+
+	systemctl restart mariadb.service
+
+	#echo "UPDATE mysql.user SET Password=PASSWORD('100yard-')  WHERE User='root';" > input
+	#echo "GRANT ALL ON *.* to root@'%' IDENTIFIED BY '100yard-';" >> input
+	echo "use mysql;" > input
+    echo "SET PASSWORD FOR 'root'@localhost = PASSWORD('mysql');" > input
+	echo "flush privileges;" >> input
+	echo "exit" >> input
+
+	mysql -u root < input
+
+	sleep 30
+	systemctl restart mariadb.service
+}
+
+install_postgres()
+{
+	#
+	# Installing Postgres Server and tools
+	#
+	dnf -y install postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64
+
+	cd /usr/local/HammerDB
+	cp -R /tmp/hammerdb-tpcc/postgres/* .
+
+	rm -rf /var/lib/pgsql/data
+	rm -rf ${mountpoint}/postgres_data
+
+	mkdir -p ${mountpoint}/postgres_data
+	ln -sf ${mountpoint}/postgres_data /var/lib/pgsql/data
+	chmod 700 ${mountpoint}/postgres_data
+	chown -R postgres:postgres ${mountpoint}/postgres_data
+
+	postgresql-setup initdb
+
+	totmem=`cat /proc/meminfo |grep "MemTotal:" | awk '{print $2}'`
+
+	#
+	# Change shared_buffer size based on available memory
+	#
+	totmem_MB=`expr $totmem / 1024`
+	totmem_BP=`expr $totmem_MB / 2`   # Buffer pool is half of physical memory
+	#
+	# IF total memory is more than 128G then bufferpool is set to 64G else set to half of physical memory
+	#
+	if [ ${totmem_BP} -lt 64000 ]; then
+   		sed -i "s/^shared_buffers =.*/shared_buffers = ${totmem_BP}MB/" postgresql.conf
+	else
+	   	sed -i "s/^shared_buffers =.*/shared_buffers = 64000MB/" postgresql.conf
+	fi
+
+	/usr/bin/cp -f pg_hba.conf /var/lib/pgsql/data
+	/usr/bin/cp -f postgresql.conf /var/lib/pgsql/data
+	systemctl restart postgresql
+	echo "alter role postgres password 'postgres'" > input
+
+	psql -U postgres -d postgres < input
+	sleep 30
+	systemctl restart postgresql.service
+}
+
+usage()
+{
+  echo "Usage:
+        ./install-script [-h] [-d disk name] [-m mount point] [-t dbtype]
+
+        Usage:
+        -h help
+        -d <disk device name>
+        -m <mount point>
+	-t <mariadb, mssql, postgres>
+
+
+       Examples:
+        ./install-script -d '/dev/sdb' 
+        ./install-script -d '/perf1' 
+  "
+}
+
+#
+# If we did not pass any arguments, flag it.
+#
+if [ $# -eq 0 ]; then
+    usage;
+    exit;
+fi
+
+while [ $# -gt 0 ]
+do
+	case $1 in
+        	-h)
+			usage;
+			exit;
+		;;
+        	-d)
+			disks=$2
+			shift 2
+		;;
+		-m)
+			mountpoint=$2
+			shift 2
+		;;
+		-t) 
+			db_type=$2
+			shift 2
+		;;
+		*)
+			usage;
+			exit;
+		;;
+	esac
+done
+
+if [[ $db_type == "none" ]]; then
+	echo You need to designate the db type.
+	usage
+	exit
+fi
+
+#
+# Turn selinux off.
+#
+setenforce 0
+
+#
+# Retrieve the hammerdb script
+#
+curl -o /tmp/hammerdb-tpcc.tar http://people.redhat.com/srao/Hammerdb-Kit/hammerdb-tpcc.tar
+
+#
+# Install the hammerdb
+#
+cd /tmp
+tar xf hammerdb-tpcc.tar
+cd /tmp/hammerdb-tpcc/Hammerdb
+unset DISPLAY
+echo "y" > input
+echo "/usr/local/HammerDB" >> input
+./HammerDB-3.2-Linux-x86-64-Install < input
+
+#
+# Shutdown all running instances
+#
+systemctl stop mssql-server
+systemctl stop postgresql
+systemctl stop mariadb
+
+#
+# Create filestems and mount if required
+#
+if [[ $mountpoint == *"none"* ]]; then
+	echo "using disk option"
+	umount /perf1
+	mkfs.xfs -f ${disks}
+	mkdir -p /perf1
+	mount ${disks} /perf1
+	mountpoint="/perf1"
+else
+	echo "using mountpoint option"
+	echo ${mountpoint}
+fi
+
+if [[ $db_type == "mssql" ]]; then
+	install_mssql
+	exit
+fi
+
+if [[ $db_type == "mariadb" ]]; then
+	install_mariadb
+	exit
+fi
+
+if [[ $db_type == "postgres" ]]; then
+	install_postgres
+	exit
+fi
+
