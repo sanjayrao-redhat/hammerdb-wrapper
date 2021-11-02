@@ -90,7 +90,7 @@ create_and_mount_fs()
 	umount /perf1
 
 
-	$TOOLS_BIN/lvm_create --devices "${disks}" --lvm_vol hammerdb --lvm_grp hammerdb
+	$TOOLS_BIN/lvm_create --devices "${disks}" --lvm_vol hammerdb --lvm_grp hammerdb --wipefs
 	if [ $? -ne 0 ]; then
 		echo LVM create failed.
 		exit 1
