@@ -67,7 +67,7 @@ install_mariadb()
 	#
 #	dnf -y install mariadb.x86_64 mariadb-common.x86_64 mariadb-devel.x86_64 \
 #	mariadb-errmsg.x86_64 mariadb-server.x86_64 mariadb-server-utils.x86_64 mysql-libs.x86_64
-	dnf -y install mariadb.x86_64 mariadb-common.x86_64 mariadb-devel.x86_64 \
+	dnf -y install mariadb.x86_64 mariadb-common.x86_64 \
 	mariadb-errmsg.x86_64 mariadb-server.x86_64 mariadb-server-utils.x86_64
 
 
